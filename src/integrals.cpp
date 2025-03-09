@@ -1,718 +1,410 @@
-#include <cmath>
 #include <fstream>
-#include <array>
-
+#include <iostream>
 
 #ifdef OPEN_MP
     #include<omp.h>
-    const int NTHREADS = omp_get_max_threads();
 #endif
 
-#include "particle_data_group.h"
 #include "utils.h"
 #include "integrals.h"
 
+const std::vector<NonZeroLevi> nonZeroLeviElements = getNonZeroLevi();
 
-//for a description of the functions refer to integrals.h
-void polarization_midrapidity(double pT, double phi, pdg_particle particle, vector<element> &freeze_out_sup, ofstream &fileout){
-    double P_vorticity[4] = {0,0,0,0};
-    double P_shear[4] = {0,0,0,0};
-    int t_vect[4] = {1,0,0,0};
-    double Denominator = 0;
+double momentumCM(double s, double m1, double m2) {
+    if (s < (m1 + m2) * (m1 + m2)) {
+        std::cerr << "Error: sqrt of negative number. Ensure s is large enough." << std::endl;
+        exit(1);
+    }
+    
+    double term = (s - (m1 + m2) * (m1 + m2)) * (s - (m1 - m2) * (m1 - m2));
+    return sqrt(term) / (2.0 * sqrt(s));
+}
 
-    // get particle's info
-    const double mass = particle.get_mass();  //GeV
-    const int baryonNumber = particle.get_b();
-    const int electricCharge = particle.get_q();
-    const int strangeness = particle.get_s();
+std::array<double, 3> ResonanceThreeMomentum(const double MR, const double E, const double Es, const std::array<double, 3>& p, const std::array<double, 3>& ps) {
+    std::array<double, 3> pdiff, PR;
 
-    double mT = sqrt(mass * mass + pT*pT);
-    array<double,4> p = {mT, pT *cos(phi), pT *sin(phi), 0};
-    array<double,4> p_ = {mT, -pT *cos(phi), -pT *sin(phi), 0}; //lower indices    
+    for (size_t mu = 0; mu < 3; ++mu) {
+        pdiff[mu] = p[mu] - ps[mu];
+    }
+
+    const double pnorm = dotProduct(pdiff, pdiff);
+    const double denom = (Es + E) * (Es + E) - pnorm;
+    if (denom == 0) {
+        std::cerr << "Error: Division by zero in ResonanceThreeMomentum." << std::endl;
+        exit(1);
+    }
+
+    for (size_t mu = 0; mu < 3; ++mu) {
+        PR[mu] = 2 * MR * (Es + E) * pdiff[mu] / denom;
+    }
+
+    return PR;
+}
+
+double Jacobian(const double Mm, const double E, const std::array<double,3>& p, const double Mp, const double Es, const std::array<double,3>& ps) {
+    double pps = dotProduct(p,ps);
+    double num = pow(Mm,3)*(Es+E)*(Es+E)*((Es+E)*(Es+E)- (E*Es + pps + Mp*Mp));
+    double den = Es*pow(E*Es + pps + Mp*Mp,3);
+    return num/den;
+}
+
+std::array<double,3> RestFrameSpinVector(const double mass, const std::array<double,3>& p, const std::array<double,3>& S) {
+    std::array<double, 3> Sstar = {0.,0.,0.};
+    double en = sqrt(dotProduct(p,p)+mass*mass);
+    double pS = dotProduct(p,S);
+    
+    for (size_t mu = 0; mu < 3; ++mu) {
+        Sstar[mu] = S[mu] - p[mu]*pS/(en*(en+mass));
+    }
+    return Sstar;
+}
+
+double aux_exact_polarization(double spin, double pu, double T, double mutot, double abs_theta) {
+    double num = 0;
+    double den = 1e-20;
+    int fermi_or_bose = statistics(spin);
+    
+    if (fermi_or_bose == 0) {
+        std::cerr << "Error: Unknown statistics (fermi_or_bose == 0)!" << std::endl;
+        exit(1);
+    }
+
+    double exp_factor = (pu - mutot) / T;
+    
+    for (double k = -spin; k <= spin; ++k) {
+        double denominator = exp(exp_factor - k * abs_theta) + fermi_or_bose;
+        num += k / denominator;
+        den += 1 / denominator;
+    }
+
+    if (den == 0) {
+        std::cerr << "Denominator is zero in aux_exact_polarization!" << std::endl;
+        exit(1);
+    }
+
+    return num / den;
+}
+
+void sum_over_surface(const std::vector<element> &freeze_out_sup, const Particle& particle, const std::array<double, 4> p, double& dndp, double P_vorticity[4], double P_shear[4]){
+    dndp = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        P_vorticity[i] = 0.0;
+        P_shear[i] = 0.0;
+    }
+    const std::array<double, 4> p_ = {p[0], -p[1], -p[2], -p[3]}; // p_ is covariant
+    const double mass = particle.get_mass();
 
     #ifdef OPEN_MP
-        int threads_ = NTHREADS; 
-        #pragma omp parallel for num_threads(threads_) reduction(+:Denominator,P_vorticity,P_shear)
+    #pragma omp parallel for reduction(+:P_vorticity[:4], P_shear[:4], dndp)
     #endif
-    for(element cell : freeze_out_sup){ //loop over the FO hypersurface
-        double pdSigma = 0., pu = 0.;  //scalar products p\cdot d\Sigma and p\cdot u (u is the four velocity)
-        array<double,4> theta_vector = {0,0,0,0};
-        double theta_sq = 0.;
+    for(size_t i = 0; i < freeze_out_sup.size(); i++){ //loop over the FO hypersurface
+        const element& cell = freeze_out_sup[i];
+        double pdSigma = p[0] * cell.dsigma[0] + p[1] * cell.dsigma[1] + p[2] * cell.dsigma[2] + p[3] * cell.dsigma[3]; // GeV fm3
+        double pu = p[0] * cell.u[0] - p[1] * cell.u[1] - p[2] * cell.u[2] - p[3] * cell.u[3]; // GeV
 
-        for(array<int,5> indices_an_levi : non_zero_levi()){
-            int mu = indices_an_levi[0];
-            int nu = indices_an_levi[1];
-            int rh = indices_an_levi[2];
-            int sg = indices_an_levi[3]; 
-            int LeviCivita = indices_an_levi[4];  //levi(mu,nu,rh,sg)
+        const double mutot = cell.mub*particle.get_baryon() + cell.muq*particle.get_charge() + cell.mus*particle.get_strange();
+	const double nf = 1.0 / (exp( (pu - mutot) / cell.T) + 1.0);
+	
+        dndp += pdSigma * nf ;
+        //variables to the sum involving Levi Civita tensor. The indices in all expressions have been renamed so that Levi Civita tensor has indices in the order 
+        
+        double S1_thw[4] = {0.,0.,0.,0.};
+        double S1_ths[4] = {0.,0.,0.,0.};
+        
+        for (const auto& element : nonZeroLeviElements) {
+            int mu = element.mu;
+            int nu = element.nu;
+            int rh = element.rh;
+            int sg = element.sg;
+            double Levi = element.value; // Can be only 1 or -1. 0 has been discarded earlier to avoid unnecessary loops
             
-            theta_vector[mu] += LeviCivita
-                                * p_[sg] * cell.dbeta[nu][rh]/(2*mass)*hbarC; //hbarC makes theta adimensional
-		           
-        }
-
-        for (int mu = 0; mu < 4; mu++) {
-            pdSigma += p[mu] * cell.dsigma[mu];
-            pu += p[mu] * cell.u[mu] * gmumu[mu];
-            theta_sq += theta_vector[mu]*theta_vector[mu]*gmumu[mu];
-        }
-        const double mutot = cell.mub*baryonNumber + cell.muq*electricCharge + cell.mus*strangeness;
-        const double nf = 1 / (exp( (pu - mutot) / cell.T) + 1.0);
-
-        Denominator += pdSigma * nf ;
-        for(int mu=0; mu<4; mu++){
-            // computing the vorticity induced polarization
-            P_vorticity[mu] += 0.5*pdSigma * nf *  
-                        (theta_vector[mu]/sqrt(-theta_sq)) * sinh(sqrt(-theta_sq)*0.5)/
-                        (cosh(sqrt(-theta_sq)*0.5)+exp(-(pu - mutot)/cell.T));
-        }
-
-        for(array<int,5> indices_an_levi : non_zero_levi()){
-            int mu = indices_an_levi[0];
-            int nu = indices_an_levi[1];
-            int rh = indices_an_levi[2];
-            int sg = indices_an_levi[3]; 
-            int LeviCivita = indices_an_levi[4];  //levi(mu,nu,rh,sg)
-
-            if(nu==0)
-            for(int ta=0; ta<4; ta++){
-            P_shear[mu] += - pdSigma * nf * (1. - nf) * LeviCivita*t_vect[nu]* p_[sg] * p[ta] / p[0] 
-                        * ( cell.dbeta[rh][ta] + cell.dbeta[ta][rh])/ (8.0 * mass);
+            S1_thw[mu] += Levi * p_[sg] * cell.dbeta[nu][rh]; // epsilon^{mu nu rho sigma} p_{sigma} d_nu beta_rho. Eq(40) fm^{-1}
+            
+            if (nu == 0) {
+                for (int ta = 0; ta < 4; ta++) {
+                    S1_ths[mu] += -Levi * p_[sg] * p[ta] * (cell.dbeta[rh][ta] + cell.dbeta[ta][rh]);// epsilon^{mu nu rho sigma} t_nu p_{sigma} p^{tau} xi_{rho tau}. Eq(40) GeV fm^{-1}
+		}
             }
         }
-
-    } //end surface loop
-
-    //print to file
-    fileout << "   " << pT << "   " << phi << "   " << Denominator;
-    for(int mu=0; mu<4; mu++)
-        fileout << "   " << P_vorticity[mu];
-    for(int mu=0; mu<4; mu++)
-        fileout << "   " << P_shear[mu] *hbarC; //Unit conversion to make the shear adimensional 
-    fileout << endl;
-
-}
-
-void polarization_midrapidity_linear(double pT, double phi, pdg_particle particle, vector<element> &freeze_out_sup, ofstream &fileout){
-    double P_vorticity[4] = {0,0,0,0};
-    double P_shear[4] = {0,0,0,0};
-    double Denominator = 0;
-
-    // get particle's info
-    const double mass = particle.get_mass();  //GeV
-    const int baryonNumber = particle.get_b();
-    const int electricCharge = particle.get_q();
-    const int strangeness = particle.get_s();
-
-    double mT = sqrt(mass * mass + pT*pT);
-    array<double,4> p = {mT, pT *cos(phi), pT *sin(phi), 0};
-    array<double,4> p_ = {mT, -pT *cos(phi), -pT *sin(phi), 0}; //lower indices    
-
-    #ifdef OPEN_MP
-        int threads_ = NTHREADS; 
-        #pragma omp parallel for num_threads(threads_) reduction(+:Denominator,P_vorticity,P_shear)
-    #endif
-    for(element cell : freeze_out_sup){ //loop over the FO hypersurface
-        double pdSigma = 0., pu = 0.;  //scalar products p\cdot d\Sigma and p\cdot u (u is the four velocity)
-
+        
         for (int mu = 0; mu < 4; mu++) {
-            pdSigma += p[mu] * cell.dsigma[mu];
-            pu += p[mu] * cell.u[mu] * gmumu[mu];
-        }
-        const double mutot = cell.mub*baryonNumber + cell.muq*electricCharge + cell.mus*strangeness;
-        const double nf = 1 / (exp( (pu - mutot) / cell.T) + 1.0);
-
-        Denominator += pdSigma * nf ;
-        for(array<int,5> indices_an_levi : non_zero_levi()){
-            int mu = indices_an_levi[0];
-            int nu = indices_an_levi[1];
-            int rh = indices_an_levi[2];
-            int sg = indices_an_levi[3]; 
-            int LeviCivita = indices_an_levi[4];  //levi(mu,nu,rh,sg)      
-            P_vorticity[mu] += pdSigma * nf * (1. - nf) * LeviCivita
-                                    * p_[sg] * cell.dbeta[nu][rh];
-                    
-            if(nu==0)
-            for(int ta=0; ta<4; ta++)
-            P_shear[mu] += -pdSigma * nf * (1. - nf) * LeviCivita
-                        * p_[sg] * (p[ta] / p[0]) *t_vector[nu]
-                        * ( cell.dbeta[rh][ta] + cell.dbeta[ta][rh]);
+            P_vorticity[mu] += pdSigma * nf * (1. - nf) * S1_thw[mu]; // GeV fm^{2}
+            P_shear[mu] += pdSigma * nf * (1. - nf) * S1_ths[mu] / p[0]; // GeV fm^{2}
         }
     }
-    //print to file
-    fileout << "   " << pT << "   " << phi << "   " << Denominator;
-    for(int mu=0; mu<4; mu++)
-        fileout << "   " << P_vorticity[mu]/ (8.0 * mass) *hbarC; //unit conversion to make the vorticity adimensional
-    for(int mu=0; mu<4; mu++)
-        fileout << "   " << P_shear[mu]/ (8.0 * mass) *hbarC; //Unit conversion to make the shear adimensional 
-    fileout << endl;
-
+    
+    for (int mu = 0; mu < 4; mu++) {
+        P_vorticity[mu] = P_vorticity[mu]/ (8.0 * mass) *hbarC; // GeV fm^3
+        P_shear[mu] = P_shear[mu]/ (8.0 * mass) *hbarC; // GeV fm^3
+    }
 }
 
-void polarization_exact_rapidity(double pT, double phi, double y_rap, pdg_particle particle, vector<element> &freeze_out_sup, ofstream &fileout){
-    double P_vorticity[4] = {0,0,0,0};
-    double P_shear[4] = {0,0,0,0};
-    double Denominator = 0;
-
-    // get particle's info
-    const double mass = particle.get_mass();  //GeV
-    const int baryonNumber = particle.get_b();
-    const int electricCharge = particle.get_q();
-    const int strangeness = particle.get_s();
-    const double spin = particle.get_spin();
+void sum_over_surface_exact(const std::vector<element> &freeze_out_sup, const Particle& particle, const std::array<double, 4> p, double& dndp, double P_vorticity[4], double P_shear[4]){
+    dndp = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        P_vorticity[i] = 0.0;
+        P_shear[i] = 0.0;
+    }
+    double dndp_=0., P_vorticity_[4]={0.,0.,0.,0.}, P_shear_[4]={0.,0.,0.,};
+    const std::array<double, 4> p_ = {p[0], -p[1], -p[2], -p[3]}; // p_ is covariant
+    const double spin = (particle.get_gspin()-1.0)/2.0;
     const int fermi_or_bose = statistics(spin);
-    const double phase_space = ((2*spin +1)/pow( 2*hbarC*PI, 3.0));
-
-    double mT = sqrt(mass * mass + pT*pT);
-    array<double,4> p = {mT *cosh(y_rap), pT *cos(phi), pT *sin(phi), mT *sinh(y_rap)};
-    array<double,4> p_ = {mT *cosh(y_rap), -pT *cos(phi), -pT *sin(phi), -mT *sinh(y_rap)}; //lower indices    
+    const double phase_space = ((2*spin +1)/pow( 2*PI, 3.0)); //dimensionless
+    const double mass = particle.get_mass();
 
     #ifdef OPEN_MP
-        int threads_ = NTHREADS; 
-        #pragma omp parallel for num_threads(threads_) reduction(+:Denominator,P_vorticity,P_shear)
+    #pragma omp parallel for reduction(+:P_vorticity[:4], P_shear[:4], dndp)
     #endif
-    for(element cell : freeze_out_sup){ //loop over the FO hypersurface
-        double pdSigma = 0., pu = 0.;  //scalar products p\cdot d\Sigma and p\cdot u (u is the four velocity)
-        array<double,4> theta_vector = {0,0,0,0};
-        double theta_sq = 0.;
-
-        for(array<int,5> indices_an_levi : non_zero_levi()){
-            int mu = indices_an_levi[0];
-            int nu = indices_an_levi[1];
-            int rh = indices_an_levi[2];
-            int sg = indices_an_levi[3]; 
-            int LeviCivita = indices_an_levi[4];//levi(mu,nu,rh,sg)
-		                theta_vector[mu] += LeviCivita
-                                * p_[sg] * cell.dbeta[nu][rh]/(2*mass)*hbarC; //theta is adimensional
-		   }
-
-        for (int mu = 0; mu < 4; mu++){
-            pdSigma += p[mu] * cell.dsigma[mu];
-            pu += p[mu] * cell.u[mu] * gmumu[mu];
-            theta_sq += theta_vector[mu]*theta_vector[mu]*gmumu[mu];
-        }
-        const double mutot = cell.mub*baryonNumber + cell.muq*electricCharge + cell.mus*strangeness;
-        const double distribution = 1 / (exp( (pu - mutot) / cell.T) + fermi_or_bose);
-
-        Denominator += phase_space*pdSigma * distribution ;
+    for(size_t i = 0; i < freeze_out_sup.size(); i++){ //loop over the FO hypersurface
+        const element& cell = freeze_out_sup[i];
+        double pdSigma = p[0] * cell.dsigma[0] + p[1] * cell.dsigma[1] + p[2] * cell.dsigma[2] + p[3] * cell.dsigma[3]; // GeV fm3
+        double pu = p[0] * cell.u[0] - p[1] * cell.u[1] - p[2] * cell.u[2] - p[3] * cell.u[3]; // GeV
+        const double mutot = cell.mub*particle.get_baryon() + cell.muq*particle.get_charge() + cell.mus*particle.get_strange();
+        const double dist = 1.0 / (exp( (pu - mutot) / cell.T) + fermi_or_bose);
+	
+        dndp += phase_space * pdSigma * dist ; // GeV fm^3
         
-        for(int mu=0; mu<4; mu++){
-            // computing the vorticity induced polarization
-            P_vorticity[mu] += phase_space*pdSigma * distribution *  
-                        (theta_vector[mu]/sqrt(-theta_sq)) * 
-                        aux_exact_polarization(spin, pu, cell.T, mutot, sqrt(-theta_sq));
+        //variables to the sum involving Levi Civita tensor. The indices in all expressions have been renamed so that Levi Civita tensor has indices in the order 
+        
+        std::array<double,4> theta_vector = {0,0,0,0};
+        double S1_ths[4] = {0.,0.,0.,0.};
+        
+        for (const auto& element : nonZeroLeviElements) {
+            int mu = element.mu;
+            int nu = element.nu;
+            int rh = element.rh;
+            int sg = element.sg;
+            double Levi = element.value; // Can be only 1 or -1. 0 has been discarded earlier to avoid unnecessary loops
+            
+            theta_vector[mu] += Levi*p_[sg]*cell.dbeta[nu][rh]*hbarC/(2.0*mass); //dimensionless
+            
+            if (nu == 0) {
+                for (int ta = 0; ta < 4; ta++) {
+                    S1_ths[mu] += -(spin/3.0) * (spin + 1) * Levi * (p_[sg]/mass) * (p[ta]/p[0]) * (cell.dbeta[rh][ta] + cell.dbeta[ta][rh]) * hbarC / 2.0;// epsilon^{mu nu rho sigma} t_nu p_{sigma} p^{tau} xi_{rho tau}. Eq(40) (dimensionless)
+		}
+            }
         }
-            // computing the shear induced polarization
-            for(array<int,5> indices_an_levi : non_zero_levi()){
-            int mu = indices_an_levi[0];
-            int nu = indices_an_levi[1];
-            int sg = indices_an_levi[2];
-            int ta = indices_an_levi[3];
-            int LeviCivita = indices_an_levi[4];//levi(mu,nu,sg,ta)
-
-            if(nu==0)
-            for(int rh=0; rh<4; rh++){
-                P_shear[mu] += - phase_space*(spin/3)*(spin+1)*pdSigma * distribution * (1. - fermi_or_bose*distribution) 
-                            * LeviCivita* (p_[ta]/mass) * (p[rh]/p[0]) 
-                            *hbarC*( cell.dbeta[sg][rh] + cell.dbeta[rh][sg])/ 2.0;
-                            //hbarC: unit conversion to make the shear adimensional 
-                    }
-        }
-    }
-
-    //print to file
-    fileout << "   " << pT << "   " << phi << "   " << y_rap << "   " << Denominator;
-    for(int mu=0; mu<4; mu++)
-        fileout << "   " << P_vorticity[mu];
-    for(int mu=0; mu<4; mu++)
-        fileout << "   " << P_shear[mu]; 
-    fileout << endl;
-
-}
-
-
-double aux_exact_polarization(double spin, double pu, double T, double mutot, double abs_theta){
-double num = 0;
-double den = 1e-20;
-int fermi_or_bose = statistics(spin);
-for(double k=-spin; k<=spin;k++){
-            num += k/(exp((pu-mutot)/T-k*abs_theta)+fermi_or_bose);
-            den += 1/(exp((pu-mutot)/T-k*abs_theta)+fermi_or_bose);
-        }
-
-if(num/den != num/den){
-    cout<<"NaN in aux_exact_polarization!"<<endl;
-    exit(1);
-}
-
-return num/den;
-}
-
-int statistics(double spin){
-    //returns 1 if Fermi, -1 if Bose statistics
-    const double dim_spin = 2*spin+1;
-    if(dim_spin != (int) dim_spin){
-        exit(1);
-    }
-    if((int)dim_spin % 2 == 0){
-        return 1;
-    }
-    else if((int)dim_spin % 2 == 1){
-        return -1;
-    }
-    return 0;
-}
-
-void spectrum_rapidity(double pT, double phi, double y_rap, pdg_particle particle, vector<element> &freeze_out_sup, ofstream &fileout){
-    double dNd3p = 0;
-    
-    // get particle's info
-    const double mass = particle.get_mass();  
-    const int baryonNumber = particle.get_b();
-    const int electricCharge = particle.get_q();
-    const int strangeness = particle.get_s();
-    
-    const int spin = particle.get_spin(); //Dimension of the spin Hilbert space: if even -> fermions, if odd -> bosons
-    int fermi_or_bose = statistics(spin); //the factor to add in the denominator of the distribution: 1 Fermi-Dirac, -1 Bose-Einstein
-    
-    double mT = sqrt(mass * mass + pT*pT);
-    array<double,4> p = {mT *cosh(y_rap), pT *cos(phi), pT *sin(phi), mT *sinh(y_rap)};
-    array<double,4> p_ = {mT *cosh(y_rap), -pT *cos(phi), -pT *sin(phi), -mT *sinh(y_rap)}; //lower indices    
-
-    #ifdef OPEN_MP
-        int threads_ = NTHREADS; 
-        #pragma omp parallel for num_threads(threads_) reduction(+:dNd3p)
-    #endif
-    for(element cell : freeze_out_sup){ //loop over the FO hypersurface
-        double pdSigma = 0., pu = 0.;  //scalar products p\cdot d\Sigma and p\cdot u (u is the four velocity)
-
+        
+        double theta_sq = theta_vector[0]*theta_vector[0] - theta_vector[1]*theta_vector[1] - theta_vector[2]*theta_vector[2] - theta_vector[3]*theta_vector[3];
+        
         for (int mu = 0; mu < 4; mu++) {
-            pdSigma += p[mu] * cell.dsigma[mu];
-            pu += p[mu] * cell.u[mu] * gmumu[mu];
-        }
-        const double mutot = cell.mub*baryonNumber + cell.muq*electricCharge + cell.mus*strangeness;
-        const double distribution = (1/(pow(2*PI,3))) *1/ (exp( (pu - mutot) / cell.T) + fermi_or_bose);
-
-        dNd3p += pdSigma * distribution ;
-        
-    }
-
-    //print to file
-    fileout << "   " << pT << "   " << phi << "   " << y_rap << "   " << dNd3p/(hbarC*hbarC*hbarC) << endl; //hbarC for unit conversion
-
-}
-
-void polarization_components(pdg_particle particle, std::array<vector<element>,5> components, std::array<string,5> fileout_list){
-    int size_pt = 20;
-    int size_phi = 30;
-    int size_y = 20;
-    std::vector<double> pT = linspace(0,6.2,size_pt);
-    std::vector<double> phi =  linspace(0,2*PI,size_phi);
-    std::vector<double> y_rap =  linspace(-1,1,size_y);
-
-    ofstream fout0(fileout_list[0]),fout1(fileout_list[1]),fout2(fileout_list[2]),
-	fout3(fileout_list[3]),fout4(fileout_list[4]);
-
-	for(double ipt : pT){
-		for(double iphi : phi){
-			for(double iy : y_rap){
-                polarization_exact_rapidity(ipt, iphi, iy, particle, components[0], fout0);
-                polarization_exact_rapidity(ipt, iphi, iy, particle, components[1], fout1);
-                polarization_exact_rapidity(ipt, iphi, iy, particle, components[2], fout2);
-                polarization_exact_rapidity(ipt, iphi, iy, particle, components[3], fout3);
-                polarization_exact_rapidity(ipt, iphi, iy, particle, components[4], fout4);
-            }
+            P_vorticity[mu] += phase_space * pdSigma * dist * (theta_vector[mu]/sqrt(-theta_sq)) * aux_exact_polarization(spin, pu, cell.T, mutot, sqrt(-theta_sq));  // GeV fm^3
+            P_shear[mu] += phase_space * pdSigma * dist * (1. - fermi_or_bose*dist) * S1_ths[mu]; // GeV fm^3
         }
     }
-
 }
- 
 
-void Lambda_polarization_FeedDown(double pT, double phi, double y_rap, pdg_particle mother, 
-    interpolator &spectrum_interpolator, array<interpolator,4> &S_vorticity_interpolator, array<interpolator,4> &S_shear_interpolator, ofstream &fileout){
-    pdg_particle lambda(3122);
+void compute_primary(const std::vector<double>& pT_vec, const std::vector<double>& phi_vec, const std::vector<double>& y_vec, std::map<int, Particle>& particles, std::vector<element>& freeze_out_sup, const bool exact, const bool decay, int pdg_id) {
 
-    double P_vorticity[3] = {0,0,0};
-    double P_shear[3] = {0,0,0};
-    double Denominator = 1e-20;
-    
-	const double lambda_mass = lambda.get_mass(); 
-	
-	//fetch information concerning mother and second son
-	const double mother_mass = mother.get_mass();  
-	const double mother_baryonCharge = mother.get_b();
-	const double mother_electricCharge = mother.get_q();
-	const double mother_strangeness = mother.get_s();
-    
-    pdg_particle* second_son;
-
-    if(mother.get_id()==3212){
-        second_son = new pdg_particle(22);
-    }
-    else if(mother.get_id() == 3224){
-        second_son = new pdg_particle(211);
-    }
-    else{
-        cout<< "ERROR! The decay is not implemented yet!"<<endl;
-        exit(1);
-    }
-
-    double second_son_mass = second_son->get_mass();
-
-    double mT = sqrt(lambda_mass * lambda_mass + pT*pT);
-    //momentum of the Lambda particle in the Lab frame
-    array<double,4> p = {mT *cosh(y_rap), pT *cos(phi), pT *sin(phi), mT *sinh(y_rap)};
-    array<double,4> p_ = {mT *cosh(y_rap), -pT *cos(phi), -pT *sin(phi), -mT *sinh(y_rap)}; //lower indices  
-
-    //Energy and momentum of the Lambda particle in the mother's rest frame
-    double E_Lambda_rest = (mother_mass*mother_mass + lambda_mass*lambda_mass - second_son_mass*second_son_mass)/(2*mother_mass); 
-    double p_rest_abs = sqrt(E_Lambda_rest*E_Lambda_rest - lambda_mass*lambda_mass);
-
-    int number_of_bins = 30;
-    double dangle = PI/number_of_bins;
-    #ifdef OPEN_MP
-        int threads_ = NTHREADS;
-        #pragma omp parallel for num_threads(threads_) reduction(+:Denominator,P_vorticity,P_shear)
-    #endif
-    for(int itheta=0; itheta<number_of_bins; itheta++){
-        double dtheta = itheta*dangle;
-        double integralphi_den = 1e-20;
-        double integralphi_num[3] = {0,0,0}; 
-        double integralphi_numShear[3] = {0,0,0}; 
-        for(double dphi=0; dphi<2*PI-1e-5; dphi+=dangle){
-            double rest_frame_Pi[3] = {0,0,0}; //polarization in the rest frame of the mother
-            double rest_frame_PiShear[3] = {0,0,0}; //polarization in the rest frame of the mother, shear contribution
-            double S_vect[3]={0,0,0};//the particular vector depending on the decay. For details 1905.03123
-            double S_vectShear[3]={0,0,0};//the particular vector depending on the decay, shear contribution
-            double spectrum = 1e-20;
-            double polarization_mother[4]={0,0,0,0};
-            double polarization_mother_shear[4]={0,0,0,0};
-    
-            double p_rest[3] = {p_rest_abs*sin(dtheta)*cos(dphi),p_rest_abs*sin(dtheta)*sin(dphi),p_rest_abs*cos(dtheta)}; //spatial momentum of \Lambda in mother rest frame. p^0 is irrelevant to the calculation
-            //jacobian from eq. 30 of 1905.03123
-            double jacobian = pow(mother_mass,3)*pow(p[0] + E_Lambda_rest,2)*
-                                (pow(p[0] + E_Lambda_rest,2)-(lambda_mass*lambda_mass+p[0]*E_Lambda_rest+p[1]*p_rest[0]+p[2]*p_rest[1]+p[3]*p_rest[2]))/
-                                (E_Lambda_rest*pow(lambda_mass*lambda_mass+p[0]*E_Lambda_rest+p[1]*p_rest[0]+p[2]*p_rest[1]+p[3]*p_rest[2],3));
-            //momentum of the mother
-            double Energy_mother;
-            double P_mother[4];
-            double P_mother_[4];
-            //upper indices
-            P_mother[1] = (p[1]-p_rest[0])*2*mother_mass*(p[0] + E_Lambda_rest)/
-                        (pow(p[0] + E_Lambda_rest,2)-pow(p[1]-p_rest[0],2)-pow(p[2]-p_rest[1],2)-pow(p[3]-p_rest[2],2));
-            P_mother[2] = (p[2]-p_rest[1])*2*mother_mass*(p[0] + E_Lambda_rest)/
-                        (pow(p[0] + E_Lambda_rest,2)-pow(p[1]-p_rest[0],2)-pow(p[2]-p_rest[1],2)-pow(p[3]-p_rest[2],2));
-            P_mother[3] = (p[3]-p_rest[2])*2*mother_mass*(p[0] + E_Lambda_rest)/
-                        (pow(p[0] + E_Lambda_rest,2)-pow(p[1]-p_rest[0],2)-pow(p[2]-p_rest[1],2)-pow(p[3]-p_rest[2],2));
-            Energy_mother = sqrt(mother_mass*mother_mass+pow(P_mother[1],2)+pow(P_mother[2],2)+pow(P_mother[3],2));
-            P_mother[0] = Energy_mother; 
-            //lower indices
-            P_mother_[1] = -P_mother[1];
-            P_mother_[2] = -P_mother[2];
-            P_mother_[3] = -P_mother[3];
-            P_mother_[0] = Energy_mother;
-            
-            double pt_mom = sqrt(P_mother[1]*P_mother[1]+P_mother[2]*P_mother[2]);
-            double phi_mom = atan2(P_mother[2],P_mother[1]); //azimuthal angle of the mother [0,2\pi]
-            if(phi_mom<0){
-                phi_mom += 2*PI;
-            }
-            double y_mom = atanh(P_mother[3]/P_mother[0]);
-
-            spectrum = spectrum_interpolator.trilinear_interpol(pt_mom, phi_mom, y_mom);
-
-            polarization_mother[0] = S_vorticity_interpolator[0].trilinear_interpol(pt_mom, phi_mom, y_mom);
-            polarization_mother[1] = S_vorticity_interpolator[1].trilinear_interpol(pt_mom, phi_mom, y_mom);
-            polarization_mother[2] = S_vorticity_interpolator[2].trilinear_interpol(pt_mom, phi_mom, y_mom);
-            polarization_mother[3] = S_vorticity_interpolator[3].trilinear_interpol(pt_mom, phi_mom, y_mom);
-
-
-            polarization_mother_shear[0] = S_shear_interpolator[0].trilinear_interpol(pt_mom, phi_mom, y_mom);
-            polarization_mother_shear[1] = S_shear_interpolator[1].trilinear_interpol(pt_mom, phi_mom, y_mom);
-            polarization_mother_shear[2] = S_shear_interpolator[2].trilinear_interpol(pt_mom, phi_mom, y_mom);
-            polarization_mother_shear[3] = S_shear_interpolator[3].trilinear_interpol(pt_mom, phi_mom, y_mom);
-
-            //boost to the rest frame of the mother: the inverse standard boost is given by {{e/m, -(px/m), -(py/m), -(pz/m)}, {-(px/m), 1 + px^2/(e m + m^2), (px py)/(e m + m^2), (px pz)/(e m + m^2)}, {-(py/m), (px py)/(e m + m^2), 1 + py^2/(e m + m^2), (py pz)/(e m + m^2)}, {-(pz/m), (px pz)/(e m + m^2), (py pz)/(e m + m^2), 1 + pz^2/(e m + m^2)}}
-            rest_frame_Pi[0] = -((polarization_mother[0]*P_mother[1])/mother_mass) + 
-                    polarization_mother[1]*(1 + pow(P_mother[1],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-                    (polarization_mother[2]*P_mother[1]*P_mother[2])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-                    (polarization_mother[3]*P_mother[1]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
+    if(decay){
+    for (auto& [p_id, particle] : particles) {
+        if (p_id == 22){
+            std::cout << "Skipping calculation for photon." << std::endl;
+            continue;
+        }
+        for (size_t i = 0; i < pT_vec.size(); ++i) {
+            for (size_t j = 0; j < phi_vec.size(); ++j) {
+                for (size_t k = 0; k < y_vec.size(); ++k) {
                     
-            rest_frame_Pi[1] = -((polarization_mother[0]*P_mother[2])/mother_mass) + 
-                    polarization_mother[2]*(1 + pow(P_mother[2],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-                    (polarization_mother[1]*P_mother[1]*P_mother[2])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-                    (polarization_mother[3]*P_mother[2]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
-        
-            rest_frame_Pi[2] = -((polarization_mother[0]*P_mother[3])/mother_mass) + 
-                    polarization_mother[3]*(1 + pow(P_mother[3],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-                    (polarization_mother[1]*P_mother[1]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-                    (polarization_mother[2]*P_mother[2]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
-            
-            rest_frame_PiShear[0] = -((polarization_mother_shear[0]*P_mother[1])/mother_mass) + 
-                    polarization_mother_shear[1]*(1 + pow(P_mother[1],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-                    (polarization_mother_shear[2]*P_mother[1]*P_mother[2])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-                    (polarization_mother_shear[3]*P_mother[1]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
+                    double pT = pT_vec[i];
+                    double phi = phi_vec[j];
+                    double y = y_vec[k];
+
+                    double P_vorticity[4] = {0., 0., 0., 0.};
+                    double P_shear[4] = {0., 0., 0., 0.};
+                    double dndp = 0.;
+
+                    const double mass = particle.get_mass();  // GeV
+                    double mT = sqrt(mass * mass + pT * pT); // GeV
                     
-            rest_frame_PiShear[1] = -((polarization_mother_shear[0]*P_mother[2])/mother_mass) + 
-                    polarization_mother_shear[2]*(1 + pow(P_mother[2],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-                    (polarization_mother_shear[1]*P_mother[1]*P_mother[2])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-                    (polarization_mother_shear[3]*P_mother[2]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
-        
-            rest_frame_PiShear[2] = -((polarization_mother_shear[0]*P_mother[3])/mother_mass) + 
-                    polarization_mother_shear[3]*(1 + pow(P_mother[3],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-                    (polarization_mother_shear[1]*P_mother[1]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-                    (polarization_mother_shear[2]*P_mother[2]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
-            
-			//computation of the vector S depending on the decay
-            switch(mother.get_id()){
-                case 3212: //Sigma0 to Lambda and photon
-                for(int mu=0;mu<3;mu++){ 
-                    S_vect[mu] = -(p_rest[mu]/pow(p_rest_abs,2))*(rest_frame_Pi[0]*p_rest[0]+rest_frame_Pi[1]*p_rest[1]+rest_frame_Pi[2]*p_rest[2]); 
-                    S_vectShear[mu] = -(p_rest[mu]/pow(p_rest_abs,2))*(rest_frame_PiShear[0]*p_rest[0]+rest_frame_PiShear[1]*p_rest[1]+rest_frame_PiShear[2]*p_rest[2]); 
+                    // Define 4-momentum. p is contravariant
+                    std::array<double, 4> p = {mT * cosh(y), pT * cos(phi), pT * sin(phi), mT * sinh(y)};
+                    
+                    if(exact){
+                        sum_over_surface_exact(freeze_out_sup, particle, p, dndp, P_vorticity, P_shear);
+                    }else{
+                        sum_over_surface(freeze_out_sup, particle, p, dndp, P_vorticity, P_shear);
+                    }
+
+                    particle.EdN_d3p_primary[i][j][k] = dndp;
+                    for (int mu = 0; mu < 4; mu++) {
+                        particle.Pv_primary[i][j][k][mu] = P_vorticity[mu]; // GeV fm^3
+                    }
+                    for (int mu = 0; mu < 4; mu++) {
+                        particle.Ps_primary[i][j][k][mu] = P_shear[mu]; // GeV fm^3
+                    }
                 }
-                break;
-                case 3224: //Sigma* to Lambda and pion
-                for(int mu=0;mu<3;mu++){
-                    S_vect[mu] = (2.0/5.0)*rest_frame_Pi[mu] -(1.0/5.0)*(p_rest[mu]/pow(p_rest_abs,2))*(rest_frame_Pi[0]*p_rest[0]+rest_frame_Pi[1]*p_rest[1]+rest_frame_Pi[2]*p_rest[2]); 
-                    S_vectShear[mu] = (2.0/5.0)*rest_frame_PiShear[mu] -(1.0/5.0)*(p_rest[mu]/pow(p_rest_abs,2))*(rest_frame_PiShear[0]*p_rest[0]+rest_frame_PiShear[1]*p_rest[1]+rest_frame_PiShear[2]*p_rest[2]); 
-                }
-                break;
-                default:
-                cout <<"I don't know about this decay!"<< endl;
-                exit(1);
             }
-            
-            //compute integrals in phi  
-            integralphi_den += dangle*jacobian*spectrum/Energy_mother; //the n(P) in eq. 29 of 1905.03123 is no the invariant one, hence the /Energy_mother
-            for(int mu=0;mu<3;mu++){
-                integralphi_num[mu] += dangle*jacobian*(S_vect[mu]/spectrum) *spectrum/Energy_mother; //    S/spectrum = spin vector; spectrum/Energy_mother =  n(P) in eq 29 of 1905.03123
-                integralphi_numShear[mu] += dangle*jacobian*(S_vectShear[mu]/spectrum) *spectrum/Energy_mother;
-            }
-        } //end loop in iph
-        //compute integral in theta
-        Denominator += dangle*sin(dtheta)*integralphi_den;
-        for(int mu=0;mu<3;mu++){
-                P_vorticity[mu] += dangle*sin(dtheta)*integralphi_num[mu];
-                P_shear[mu] += dangle*sin(dtheta)*integralphi_numShear[mu];
         }
-    } //end loop in ith
-		
+    }
+    }else{
+        Particle& particle = particles[pdg_id];
+        for (size_t i = 0; i < pT_vec.size(); ++i) {
+            for (size_t j = 0; j < phi_vec.size(); ++j) {
+                for (size_t k = 0; k < y_vec.size(); ++k) {
+                    
+                    double pT = pT_vec[i];
+                    double phi = phi_vec[j];
+                    double y = y_vec[k];
 
-    //print to file
-    fileout << "   " << pT << "   " << phi << "   " << y_rap << "   " << Denominator;
-    for(int mu=0; mu<3; mu++)
-        fileout << "   " << P_vorticity[mu];
-    for(int mu=0; mu<3; mu++)
-        fileout << "   " << P_shear[mu]; //The hbarc to make the shear adimensional is accounted for in the table
-    fileout << endl;
+                    double P_vorticity[4] = {0., 0., 0., 0.};
+                    double P_shear[4] = {0., 0., 0., 0.};
+                    double dndp = 0.;
 
-    delete second_son;
+                    const double mass = particle.get_mass();  // GeV
+                    double mT = sqrt(mass * mass + pT * pT); // GeV
+                    
+                    // Define 4-momentum. p is contravariant
+                    std::array<double, 4> p = {mT * cosh(y), pT * cos(phi), pT * sin(phi), mT * sinh(y)};
+                    
+                    if(exact){
+                        sum_over_surface_exact(freeze_out_sup, particle, p, dndp, P_vorticity, P_shear);
+                    }else{
+                        sum_over_surface(freeze_out_sup, particle, p, dndp, P_vorticity, P_shear);
+                    }
+
+                    particle.EdN_d3p_primary[i][j][k] = dndp;
+                    for (int mu = 0; mu < 4; mu++) {
+                        particle.Pv_primary[i][j][k][mu] = P_vorticity[mu]; // GeV fm^3
+                    }
+                    for (int mu = 0; mu < 4; mu++) {
+                        particle.Ps_primary[i][j][k][mu] = P_shear[mu]; // GeV fm^3
+                    }
+                }
+            }
+        }    
+    }
 }
 
-// void Lambda_FeedDown_nointerpolation(double pT, double phi, double y_rap, pdg_particle mother, 
-//     vector<element> &freeze_out_sup, ofstream &fileout){
-//     pdg_particle lambda(3122);
-
-//     double P_vorticity[3] = {0,0,0};
-//     double P_shear[3] = {0,0,0};
-//     double Denominator = 1e-20;
+void compute_polarization_feeddown(const std::vector<double>& pT_vec, const std::vector<double>& phi_vec, const std::vector<double>& y_vec, Particle& primary, std::map<int, Particle>& particles) {
     
-// 	const double lambda_mass = lambda.get_mass(); 
-	
-// 	//fetch information concerning mother and second son
-// 	const double mother_mass = mother.get_mass();  
-// 	const double mother_baryonCharge = mother.get_b();
-// 	const double mother_electricCharge = mother.get_q();
-// 	const double mother_strangeness = mother.get_s();
-//     const double motherspin = mother.get_spin();
-//     const int fermi_or_bosemother = statistics(motherspin);
-//     const double phase_space = ((2*motherspin +1)/pow( 2*hbarC*PI, 3.0));
-
+    trilinearInterpolator interpolator(pT_vec, phi_vec, y_vec);
     
-//     pdg_particle* second_son;
-
-//     if(mother.get_id()==3212){
-//         second_son = new pdg_particle(22);
-//     }
-//     else if(mother.get_id() == 3224){
-//         second_son = new pdg_particle(211);
-//     }
-//     else{
-//         cout<< "ERROR! The decay is not implemented yet!"<<endl;
-//         exit(1);
-//     }
-
-//     double second_son_mass = second_son->get_mass();
-
-//     double mT = sqrt(lambda_mass * lambda_mass + pT*pT);
-//     //momentum of the Lambda particle in the Lab frame
-//     array<double,4> p = {mT *cosh(y_rap), pT *cos(phi), pT *sin(phi), mT *sinh(y_rap)};
-//     array<double,4> p_ = {mT *cosh(y_rap), -pT *cos(phi), -pT *sin(phi), -mT *sinh(y_rap)}; //lower indices  
-
-//     //Energy and momentum of the Lambda particle in the mother's rest frame
-//     double E_Lambda_rest = (mother_mass*mother_mass + lambda_mass*lambda_mass - second_son_mass*second_son_mass)/(2*mother_mass); 
-//     double p_rest_abs = sqrt(E_Lambda_rest*E_Lambda_rest - lambda_mass*lambda_mass);
-
-//     int number_of_bins = 20;
-//     double dangle = PI/number_of_bins;
-//     #ifdef OPEN_MP
-//         int threads_ = NTHREADS;
-//         #pragma omp parallel for num_threads(threads_) reduction(+:Denominator,P_vorticity,P_shear)
-//     #endif
-//     for(int itheta=0; itheta<number_of_bins; itheta++){ 
-//         double dtheta = itheta*dangle;
-//         double integralphi_den = 1e-20;
-//         double integralphi_num[3] = {0,0,0}; 
-//         double integralphi_numShear[3] = {0,0,0}; 
-//         for(double dphi=0; dphi<2*PI-1e-5; dphi+=dangle){
-//             double rest_frame_Pi[3] = {0,0,0}; //polarization in the rest frame of the mother
-//             double rest_frame_PiShear[3] = {0,0,0}; //polarization in the rest frame of the mother, shear contribution
-//             double S_vect[3]={0,0,0};//the particular vector depending on the decay. For details 1905.03123
-//             double S_vectShear[3]={0,0,0};//the particular vector depending on the decay, shear contribution
-//             double spectrum = 1e-20;
-//             double polarization_mother[4]={0,0,0,0};
-//             double polarization_mother_shear[4]={0,0,0,0};
+    const int pdg_id = primary.pdg_id;
+    const int size_th = 21;
+    const int size_phi = 41;
     
-//             double p_rest[3] = {p_rest_abs*sin(dtheta)*cos(dphi),p_rest_abs*sin(dtheta)*sin(dphi),p_rest_abs*cos(dtheta)}; //spatial momentum of \Lambda in mother rest frame. p^0 is irrelevant to the calculation
-//             //jacobian from eq. 30 of 1905.03123
-//             double jacobian = pow(mother_mass,3)*pow(p[0] + E_Lambda_rest,2)*
-//                                 (pow(p[0] + E_Lambda_rest,2)-(lambda_mass*lambda_mass+p[0]*E_Lambda_rest+p[1]*p_rest[0]+p[2]*p_rest[1]+p[3]*p_rest[2]))/
-//                                 (E_Lambda_rest*pow(lambda_mass*lambda_mass+p[0]*E_Lambda_rest+p[1]*p_rest[0]+p[2]*p_rest[1]+p[3]*p_rest[2],3));
-//             //momentum of the mother
-//             double Energy_mother;
-//             double P_mother[4];
-//             double P_mother_[4];
-//             //upper indices
-//             P_mother[1] = (p[1]-p_rest[0])*2*mother_mass*(p[0] + E_Lambda_rest)/
-//                         (pow(p[0] + E_Lambda_rest,2)-pow(p[1]-p_rest[0],2)-pow(p[2]-p_rest[1],2)-pow(p[3]-p_rest[2],2));
-//             P_mother[2] = (p[2]-p_rest[1])*2*mother_mass*(p[0] + E_Lambda_rest)/
-//                         (pow(p[0] + E_Lambda_rest,2)-pow(p[1]-p_rest[0],2)-pow(p[2]-p_rest[1],2)-pow(p[3]-p_rest[2],2));
-//             P_mother[3] = (p[3]-p_rest[2])*2*mother_mass*(p[0] + E_Lambda_rest)/
-//                         (pow(p[0] + E_Lambda_rest,2)-pow(p[1]-p_rest[0],2)-pow(p[2]-p_rest[1],2)-pow(p[3]-p_rest[2],2));
-//             Energy_mother = sqrt(mother_mass*mother_mass+pow(P_mother[1],2)+pow(P_mother[2],2)+pow(P_mother[3],2));
-//             P_mother[0] = Energy_mother; 
-//             //lower indices
-//             P_mother_[1] = -P_mother[1];
-//             P_mother_[2] = -P_mother[2];
-//             P_mother_[3] = -P_mother[3];
-//             P_mother_[0] = Energy_mother;
-            
-//             for(element cell : freeze_out_sup){ //loop over the FO hypersurface
-//                 double pdSigma = 0., pu = 0.;  //scalar products p\cdot d\Sigma and p\cdot u (u is the four velocity)
-//                 array<double,4> theta_vector = {0,0,0,0};
-//                 double theta_sq = 0.;
-
-//                 for(int mu=0; mu<4; mu++){
-//                     for(int nu=0; nu<4; nu++)
-//                         for(int rh=0; rh<4; rh++)
-//                             for(int sg=0; sg<4; sg++){ 
-//                                 theta_vector[mu] += levi(mu, nu, rh, sg)
-//                                         * P_mother_[sg] * cell.dbeta[nu][rh]/(2*mother_mass); 
-//                 }
-//                 theta_vector[mu] *= hbarC; //now theta is adimensional 
-//                 }
-
-//                 for (int mu = 0; mu < 4; mu++){
-//                     pdSigma += P_mother[mu] * cell.dsigma[mu];
-//                     pu += P_mother[mu] * cell.u[mu] * gmumu[mu];
-//                     theta_sq += theta_vector[mu]*theta_vector[mu]*gmumu[mu];
-//                 }
-//                 const double mutot = cell.mub*mother_baryonCharge + cell.muq*mother_electricCharge + cell.mus*mother_strangeness;
-//                 const double distribution = 1 / (exp( (pu - mutot) / cell.T) + fermi_or_bosemother);
-
-//                 spectrum += phase_space*pdSigma * distribution ;
-                
-//                 for(int mu=0; mu<4; mu++){
-//                     // computing the vorticity induced polarization
-//                     polarization_mother[mu] += phase_space*pdSigma * distribution *  
-//                                 (theta_vector[mu]/sqrt(-theta_sq)) * 
-//                                 aux_exact_polarization(motherspin, pu, cell.T, mutot, sqrt(-theta_sq));
-
-//                     // computing the shear induced polarization
-//                     for(int sg=1; sg<4; sg++)
-//                         for(int ta=1; ta<4; ta++)
-//                             for(int rh=0; rh<4; rh++){
-//                             polarization_mother_shear[mu] += - phase_space*(motherspin/3)*(motherspin+1)*pdSigma * distribution * (1. - fermi_or_bosemother*distribution) 
-//                                         * levi(mu, 0, sg, ta)* (P_mother_[ta]/mother_mass) * (P_mother[rh]/P_mother[0]) 
-//                                         *hbarC*( cell.dbeta[sg][rh] + cell.dbeta[rh][sg])/ 2.0;
-//                                         //hbarC: unit conversion to make the shear adimensional 
-//                             }
-//                 }
-//             }
-            
-//             //boost to the rest frame of the mother: the inverse standard boost is given by {{e/m, -(px/m), -(py/m), -(pz/m)}, {-(px/m), 1 + px^2/(e m + m^2), (px py)/(e m + m^2), (px pz)/(e m + m^2)}, {-(py/m), (px py)/(e m + m^2), 1 + py^2/(e m + m^2), (py pz)/(e m + m^2)}, {-(pz/m), (px pz)/(e m + m^2), (py pz)/(e m + m^2), 1 + pz^2/(e m + m^2)}}
-//             rest_frame_Pi[0] = -((polarization_mother[0]*P_mother[1])/mother_mass) + 
-//                     polarization_mother[1]*(1 + pow(P_mother[1],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-//                     (polarization_mother[2]*P_mother[1]*P_mother[2])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-//                     (polarization_mother[3]*P_mother[1]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
-                    
-//             rest_frame_Pi[1] = -((polarization_mother[0]*P_mother[2])/mother_mass) + 
-//                     polarization_mother[2]*(1 + pow(P_mother[2],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-//                     (polarization_mother[1]*P_mother[1]*P_mother[2])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-//                     (polarization_mother[3]*P_mother[2]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
+    std::vector<double> thstar = linspace(0.0,PI,size_th);
+    std::vector<double> phistar =  linspace(0.0,2*PI,size_phi);
+    
+    for (const auto& [mother_id, mother] : particles) {
+        if (mother.get_mass() <= primary.get_mass()) {
+            continue;
+        }
         
-//             rest_frame_Pi[2] = -((polarization_mother[0]*P_mother[3])/mother_mass) + 
-//                     polarization_mother[3]*(1 + pow(P_mother[3],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-//                     (polarization_mother[1]*P_mother[1]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-//                     (polarization_mother[2]*P_mother[2]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
-            
-//             rest_frame_PiShear[0] = -((polarization_mother_shear[0]*P_mother[1])/mother_mass) + 
-//                     polarization_mother_shear[1]*(1 + pow(P_mother[1],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-//                     (polarization_mother_shear[2]*P_mother[1]*P_mother[2])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-//                     (polarization_mother_shear[3]*P_mother[1]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
-                    
-//             rest_frame_PiShear[1] = -((polarization_mother_shear[0]*P_mother[2])/mother_mass) + 
-//                     polarization_mother_shear[2]*(1 + pow(P_mother[2],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-//                     (polarization_mother_shear[1]*P_mother[1]*P_mother[2])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-//                     (polarization_mother_shear[3]*P_mother[2]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
-        
-//             rest_frame_PiShear[2] = -((polarization_mother_shear[0]*P_mother[3])/mother_mass) + 
-//                     polarization_mother_shear[3]*(1 + pow(P_mother[3],2)/(P_mother[0]*mother_mass + pow(mother_mass,2))) + 
-//                     (polarization_mother_shear[1]*P_mother[1]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2)) + 
-//                     (polarization_mother_shear[2]*P_mother[2]*P_mother[3])/(P_mother[0]*mother_mass + pow(mother_mass,2));
-            
-// 			//computation of the vector S depending on the decay
-//             switch(mother.get_id()){
-//                 case 3212: //Sigma0 to Lambda and photon
-//                 for(int mu=0;mu<3;mu++){ 
-//                     S_vect[mu] =      -(p_rest[mu]/pow(p_rest_abs,2))*(rest_frame_Pi[0]     *p_rest[0]+rest_frame_Pi[1]     *p_rest[1]+rest_frame_Pi[2]     *p_rest[2]); 
-//                     S_vectShear[mu] = -(p_rest[mu]/pow(p_rest_abs,2))*(rest_frame_PiShear[0]*p_rest[0]+rest_frame_PiShear[1]*p_rest[1]+rest_frame_PiShear[2]*p_rest[2]); 
-//                 }
-//                 break;
-//                 case 3224: //Sigma* to Lambda and pion
-//                 for(int mu=0;mu<3;mu++){
-//                     S_vect[mu]      = (2.0/5.0)*rest_frame_Pi[mu]      -(1.0/5.0)*(p_rest[mu]/pow(p_rest_abs,2))*(rest_frame_Pi[0]     *p_rest[0]+rest_frame_Pi[1]     *p_rest[1]+rest_frame_Pi[2]     *p_rest[2]); 
-//                     S_vectShear[mu] = (2.0/5.0)*rest_frame_PiShear[mu] -(1.0/5.0)*(p_rest[mu]/pow(p_rest_abs,2))*(rest_frame_PiShear[0]*p_rest[0]+rest_frame_PiShear[1]*p_rest[1]+rest_frame_PiShear[2]*p_rest[2]); 
-//                 }
-//                 break;
-//                 default:
-//                 cout <<"I don't know about this decay!"<< endl;
-//                 exit(1);
-//             }
-            
-//             //compute integrals in phi  
-//             integralphi_den += dangle*spectrum*jacobian;
-//             for(int mu=0;mu<3;mu++){
-//                 integralphi_num[mu] += dangle*jacobian*S_vect[mu]; //the spectrum is not present because it simplify with the denominator in the polarization formula
-//                 integralphi_numShear[mu] += dangle*jacobian*S_vectShear[mu];
-//             }
-//         } //end loop in iph
-//         //compute integral in theta
-//         Denominator += dangle*sin(dtheta)*integralphi_den;
-//         for(int mu=0;mu<3;mu++){
-//                 P_vorticity[mu] += dangle*sin(dtheta)*integralphi_num[mu];
-//                 P_shear[mu] += dangle*sin(dtheta)*integralphi_numShear[mu];
-//         }
-//     } //end loop in ith
-		
+        const auto& dNdP_mother_primary = mother.get_dndp_primary();
+        const auto& Sv_mother_primary = mother.get_Pv_primary();
+        const auto& Ss_mother_primary = mother.get_Ps_primary();
 
-//     //print to file
-//     fileout << "   " << pT << "   " << phi << "   " << y_rap << "   " << Denominator;
-//     for(int mu=0; mu<3; mu++)
-//         fileout << "   " << P_vorticity[mu];
-//     for(int mu=0; mu<3; mu++)
-//         fileout << "   " << P_shear[mu]; //The hbarc to make the shear adimensional is accounted for in the table
-//     fileout << endl;
+        for (const auto& decay : mother.decay_channels) {
+            if (std::find(decay.daughters.begin(), decay.daughters.end(), primary.pdg_id) == decay.daughters.end()) {
+                continue;
+            }
+            
+            if (decay.num_daughters > 2){
+                std::cout << "Skipping calculation for 3 or more body decay of mother particle " << mother_id << std::endl;
+                continue;
+            }
+            
+            int other_daughters[1];
+            for (int daughter : decay.daughters) {
+                if (daughter != primary.pdg_id) {
+                    other_daughters[0] = daughter;
+                }
+            }
+            
+            const Particle& d2 = particles.at(other_daughters[0]);
+    
+            for (size_t i = 0; i < pT_vec.size(); ++i) {
+                double pT = pT_vec[i];
+                double mT = sqrt(primary.mass * primary.mass + pT * pT); // GeV
+                for (size_t j = 0; j < phi_vec.size(); ++j) {
+                    double phi = phi_vec[j];
+                    for (size_t k = 0; k < y_vec.size(); ++k) {
+                        double y = y_vec[k];
+                        // particle 4-momentum in lab frame
+                        std::array<double, 4> p = {mT * cosh(y), pT * cos(phi), pT * sin(phi), mT * sinh(y)};
+                        // extract spatial part of 4-momentum above
+                        std::array<double, 3> p3 = {p[1],p[2],p[3]};
+                        // Integrate over solid angle = sin(th) dth dphi. Hence two loops
+                        double num_eq29_vo[3] = {0., 0., 0.};
+                        double num_eq29_sh[3] = {0., 0., 0.};
+                        double den_eq29;
+                        #ifdef OPEN_MP
+                        #pragma omp parallel for reduction(+:num_eq29_vo[:3], num_eq29_sh[:3], den_eq29) collapse(2)
+                        #endif
+                        for(size_t ith = 0; ith < size_th; ith++){
+                            for (size_t iph = 0; iph < size_phi; ++iph) {
+                                //particle 3-momentum and energy in mother's rest frame
+                                std::array<double, 3> pstar;
+                                double pstar_norm = momentumCM(mother.mass*mother.mass, primary.mass, d2.mass); // magnitude particle 3-momentum
+                                double Estar = sqrt(pstar_norm*pstar_norm + primary.mass*primary.mass);//particle energy
+                                pstar[0] = pstar_norm*sin(thstar[ith])*cos(phistar[iph]); //p^x
+                                pstar[1] = pstar_norm*sin(thstar[ith])*sin(phistar[iph]); //p^y
+                                pstar[2] = pstar_norm*cos(thstar[ith]); //p^z
+                                //mother's energy, momentum, pT, phi, y in lab frame
+                                std::array<double, 3> P_mother;
+                                P_mother = ResonanceThreeMomentum(mother.mass, p[0], Estar, p3, pstar);
+                                double E_mother = sqrt(dotProduct(P_mother,P_mother) + mother.mass*mother.mass);
+                                double mother_pT = sqrt(P_mother[0]*P_mother[0]+P_mother[1]*P_mother[1]);
+                                double mother_phi = atan2(P_mother[1],P_mother[0]);
+                                if(mother_phi < 0) mother_phi += 2*PI;
+                                double mother_y = atanh(P_mother[2]/E_mother);
+                                
+                                //interpolation of quantities in lab frame
+                                // EdN/d^3p
+                                double dNdP_mother = interpolator.trilinearInterpolation(mother_pT, mother_phi, mother_y, dNdP_mother_primary);
+                                //polarization
+                                std::vector<double> Sv_mother_lab(4,0.0), Ss_mother_lab(4,0.0);
+                                Sv_mother_lab = interpolator.trilinearInterpolation(mother_pT, mother_phi, mother_y, Sv_mother_primary);
+                                Ss_mother_lab = interpolator.trilinearInterpolation(mother_pT, mother_phi, mother_y, Ss_mother_primary);
+                                
+                                //mother rest frame polarization
+                                std::array<double, 3> S3_mother_lab = {Sv_mother_lab[1],Sv_mother_lab[2],Sv_mother_lab[3]};
+                                std::array<double, 3> Sv_mother_RF = {0.,0.,0.}, Ss_mother_RF = {0.,0.,0.};
+                                Sv_mother_RF = RestFrameSpinVector(mother.mass, P_mother, S3_mother_lab);
+                                
+                                S3_mother_lab[0] = Ss_mother_lab[1];
+                                S3_mother_lab[1] = Ss_mother_lab[2];
+                                S3_mother_lab[2] = Ss_mother_lab[3];
+                                Ss_mother_RF = RestFrameSpinVector(mother.mass, P_mother, S3_mother_lab);
+                                
+                                //solid angle integrand
+                                double jac = Jacobian(mother.mass, E_mother, P_mother, primary.mass, Estar, pstar);
+                                double spv = dotProduct(Sv_mother_RF,pstar);
+                                double sps = dotProduct(Ss_mother_RF,pstar);
 
-//     delete second_son;
-// }
+                                den_eq29 += sin(thstar[ith])*jac*(dNdP_mother/E_mother);
+                                switch(mother.pdg_id){
+                                    case 3212: //Sigma0 to Lambda and photon
+                                    for(int mu=0;mu<3;mu++){
+                                        num_eq29_vo[mu] += -sin(thstar[ith])*(dNdP_mother/E_mother)*jac*spv*pstar[mu]/(pstar_norm*pstar_norm);
+                                        num_eq29_sh[mu] += -sin(thstar[ith])*(dNdP_mother/E_mother)*jac*sps*pstar[mu]/(pstar_norm*pstar_norm);
+                                    }
+                                    break;
+                                    case 3224:
+                                    for(int mu=0;mu<3;mu++){
+                                        num_eq29_vo[mu] += sin(thstar[ith])*(dNdP_mother/E_mother)*jac*0.4*(Sv_mother_RF[mu]-0.5*spv*pstar[mu])/(pstar_norm*pstar_norm);
+                                        num_eq29_sh[mu] += sin(thstar[ith])*(dNdP_mother/E_mother)*jac*0.4*(Ss_mother_RF[mu]-0.5*sps*pstar[mu])/(pstar_norm*pstar_norm);
+                                    }
+                                    break;
+                                    default:
+                                        std::cout << "The current implementation considers feeddown from 3212 and 3224 only" << std::endl;
+                                        exit(1);
+                                }
+                            }
+                        }
+                        
+                        primary.EdN_d3p_feeddown[i][j][k] = den_eq29;
+                        for (int mu = 0; mu < 3; mu++) {
+                            primary.Pv_feeddown[i][j][k][mu] = num_eq29_vo[mu];
+                        }
+                        for (int mu = 0; mu < 3; mu++) {
+                            primary.Ps_feeddown[i][j][k][mu] = num_eq29_sh[mu];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

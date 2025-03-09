@@ -2,47 +2,27 @@
 #define INTEGRALS_H
 
 #include <vector>
-#include <fstream>
-
+#include <map>
 #include "surface.h"
 #include "utils.h"
-#include "particle_data_group.h"
+#include "particle.h"
 
-using namespace std;
+double momentumCM(double s, double m1, double m2);
 
+std::vector<double> ResonanceThreeMomentum(const double MR, const double E, const std::vector<double>& p, const double Es, const std::vector<double>& ps);
 
-//computes the mean spin vector for particles emitted at midrapidity for the particle "particle" using
-//the freezeout file "freezeout_sup". For the thermal vorticity, eq. 64 of 2304.02276 is used
-//The output is written in "fileout" as a table:
-//pt phi denominator numerator_varpi numerator_xi
-//refer to 2103.10917
-void polarization_midrapidity(double pT, double phi, pdg_particle particle, vector<element> &freeze_out_sup, ofstream &fileout);
+double Jacobian(const double Mm, const double E, const std::vector<double>& p, const double Mp, const double Es, const std::vector<double>& ps);
 
-//same as the previous function but uses the linear approximation for the vorticity induced polarization. This function is faster.
-void polarization_midrapidity_linear(double pT, double phi, pdg_particle particle, vector<element> &freeze_out_sup, ofstream &fileout);
+std::vector<double> RestFrameSpinVector(const double mass, const std::vector<double>& p, const std::vector<double>& S) ;
 
-//Same as "polarization_midrapidity", but the table now includes the rapidity "y":
-//pt phi y denominator numerator_varpi numerator_xi
-void polarization_exact_rapidity(double pT, double phi, double y_rap, pdg_particle particle, vector<element> &freeze_out_sup, ofstream &fileout);
+void sum_over_surface(const std::vector<element> &freeze_out_sup, const Particle& particle, const std::array<double, 4> p, double& dndp, double P_vorticity[4], double P_shear[4]);
 
-//auxiliary function to compute polarization for any spin
-double aux_exact_polarization(double spin, double pu, double T, double mutot, double theta_sq);
+double aux_exact_polarization(double spin, double pu, double T, double mutot, double abs_theta);
 
-//auxiliary function used for distribution functions
-int statistics(double spin);
+void sum_over_surface_exact(const std::vector<element> &freeze_out_sup, const Particle& particle, const std::array<double, 4> p, double& dndp, double P_vorticity[4], double P_shear[4]);
 
-//integrates the thermal spectrum of "particle"
-void spectrum_rapidity(double pT, double phi, double y_rap, pdg_particle particle, vector<element> &freeze_out_sup, ofstream &fileout);
+void compute_primary(const std::vector<double>& pT_vec, const std::vector<double>& phi_vec, const std::vector<double>& y_vec, std::map<int, Particle>& particles, std::vector<element>& freeze_out_sup, const bool exact, const bool decay, int pdg_id);
 
-//Gets feed down polarization interpolating from tables
-void Lambda_polarization_FeedDown(double pT, double phi, double y_rap, pdg_particle mother, 
-    interpolator &spectrum_interpolator, array<interpolator,4> &S_vorticity_interpolator, array<interpolator,4> &S_shear_interpolator, ofstream &fileout);
-
-//prints components of polarization coming from different hydro gradients
-void polarization_components(pdg_particle particle, 
-        std::array<vector<element>,5> components, std::array<string,5> fileout_list);
-
-// DEPRECATED void Lambda_FeedDown_nointerpolation(double pT, double phi, double y_rap, pdg_particle mother, 
-//     vector<element> &freeze_out_sup, ofstream &fileout);
+void compute_polarization_feeddown(const std::vector<double>& pT_vec, const std::vector<double>& phi_vec, const std::vector<double>& y_vec, Particle& primary, std::map<int, Particle>& particles);
 
 #endif

@@ -97,7 +97,7 @@ void sum_over_surface(const std::vector<element> &freeze_out_sup, const Particle
     #ifdef OPEN_MP
     #pragma omp parallel for reduction(+:P_vorticity[:4], P_shear[:4], dndp)
     #endif
-    for(size_t i = 0; i < freeze_out_sup.size(); i++){ //loop over the FO hypersurface
+    for(size_t i = 0; i < freeze_out_sup.size(); ++i){ //loop over the FO hypersurface
         const element& cell = freeze_out_sup[i];
         double pdSigma = p[0] * cell.dsigma[0] + p[1] * cell.dsigma[1] + p[2] * cell.dsigma[2] + p[3] * cell.dsigma[3]; // GeV fm3
         double pu = p[0] * cell.u[0] - p[1] * cell.u[1] - p[2] * cell.u[2] - p[3] * cell.u[3]; // GeV
@@ -127,13 +127,13 @@ void sum_over_surface(const std::vector<element> &freeze_out_sup, const Particle
             }
         }
         
-        for (int mu = 0; mu < 4; mu++) {
+        for (int mu = 0; mu < 4; ++mu) {
             P_vorticity[mu] += pdSigma * nf * (1. - nf) * S1_thw[mu]; // GeV fm^{2}
             P_shear[mu] += pdSigma * nf * (1. - nf) * S1_ths[mu] / p[0]; // GeV fm^{2}
         }
     }
     
-    for (int mu = 0; mu < 4; mu++) {
+    for (int mu = 0; mu < 4; ++mu) {
         P_vorticity[mu] = P_vorticity[mu]/ (8.0 * mass) *hbarC; // GeV fm^3
         P_shear[mu] = P_shear[mu]/ (8.0 * mass) *hbarC; // GeV fm^3
     }
@@ -187,7 +187,7 @@ void sum_over_surface_exact(const std::vector<element> &freeze_out_sup, const Pa
         
         double theta_sq = theta_vector[0]*theta_vector[0] - theta_vector[1]*theta_vector[1] - theta_vector[2]*theta_vector[2] - theta_vector[3]*theta_vector[3];
         
-        for (int mu = 0; mu < 4; mu++) {
+        for (int mu = 0; mu < 4; ++mu) {
             P_vorticity[mu] += phase_space * pdSigma * dist * (theta_vector[mu]/sqrt(-theta_sq)) * aux_exact_polarization(spin, pu, cell.T, mutot, sqrt(-theta_sq));  // GeV fm^3
             P_shear[mu] += phase_space * pdSigma * dist * (1. - fermi_or_bose*dist) * S1_ths[mu]; // GeV fm^3
         }
@@ -227,10 +227,10 @@ void compute_primary(const std::vector<double>& pT_vec, const std::vector<double
                     }
 
                     particle.EdN_d3p_primary[i][j][k] = dndp;
-                    for (int mu = 0; mu < 4; mu++) {
+                    for (int mu = 0; mu < 4; ++mu) {
                         particle.Pv_primary[i][j][k][mu] = P_vorticity[mu]; // GeV fm^3
                     }
-                    for (int mu = 0; mu < 4; mu++) {
+                    for (int mu = 0; mu < 4; ++mu) {
                         particle.Ps_primary[i][j][k][mu] = P_shear[mu]; // GeV fm^3
                     }
                 }
@@ -264,10 +264,10 @@ void compute_primary(const std::vector<double>& pT_vec, const std::vector<double
                     }
 
                     particle.EdN_d3p_primary[i][j][k] = dndp;
-                    for (int mu = 0; mu < 4; mu++) {
+                    for (int mu = 0; mu < 4; ++mu) {
                         particle.Pv_primary[i][j][k][mu] = P_vorticity[mu]; // GeV fm^3
                     }
-                    for (int mu = 0; mu < 4; mu++) {
+                    for (int mu = 0; mu < 4; ++mu) {
                         particle.Ps_primary[i][j][k][mu] = P_shear[mu]; // GeV fm^3
                     }
                 }
@@ -333,7 +333,7 @@ void compute_polarization_feeddown(const std::vector<double>& pT_vec, const std:
                         #ifdef OPEN_MP
                         #pragma omp parallel for reduction(+:num_eq29_vo[:3], num_eq29_sh[:3], den_eq29) collapse(2)
                         #endif
-                        for(size_t ith = 0; ith < size_th; ith++){
+                        for(size_t ith = 0; ith < size_th; ++ith){
                             for (size_t iph = 0; iph < size_phi; ++iph) {
                                 //particle 3-momentum and energy in mother's rest frame
                                 std::array<double, 3> pstar;
@@ -358,6 +358,18 @@ void compute_polarization_feeddown(const std::vector<double>& pT_vec, const std:
                                 std::vector<double> Sv_mother_lab(4,0.0), Ss_mother_lab(4,0.0);
                                 Sv_mother_lab = interpolator.trilinearInterpolation(mother_pT, mother_phi, mother_y, Sv_mother_primary);
                                 Ss_mother_lab = interpolator.trilinearInterpolation(mother_pT, mother_phi, mother_y, Ss_mother_primary);
+
+                                // Remember: the primary computation yield numerator (surface integ of vorticity or shear) and denominator (yield) of spin vector separately. 
+                                // Mean spin vector is numerator/denominator and is done in plotting script. Here, we must divide as the mean goes into integrand.
+				for (size_t mu = 0; mu<4; ++mu){
+				    if(dNdP_mother != 0){
+				        Sv_mother_lab[mu] = Sv_mother_lab[mu]/dNdP_mother;
+					Ss_mother_lab[mu] = Ss_mother_lab[mu]/dNdP_mother;
+				    }else{
+					Sv_mother_lab[mu] = 0.0;
+					Ss_mother_lab[mu] = 0.0;
+				    }
+				}
                                 
                                 //mother rest frame polarization
                                 std::array<double, 3> S3_mother_lab = {Sv_mother_lab[1],Sv_mother_lab[2],Sv_mother_lab[3]};

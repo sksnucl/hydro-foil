@@ -333,7 +333,7 @@ void compute_polarization_feeddown(const std::vector<double>& pT_vec, const std:
                         #ifdef OPEN_MP
                         #pragma omp parallel for reduction(+:num_eq29_vo[:3], num_eq29_sh[:3], den_eq29) collapse(2)
                         #endif
-                        for(size_t ith = 0; ith < size_th; ++ith){
+                        for(size_t ith = 0; ith < size_th; ith++){
                             for (size_t iph = 0; iph < size_phi; ++iph) {
                                 //particle 3-momentum and energy in mother's rest frame
                                 std::array<double, 3> pstar;
@@ -361,9 +361,9 @@ void compute_polarization_feeddown(const std::vector<double>& pT_vec, const std:
 
                                 // Remember: the primary computation yield numerator (surface integ of vorticity or shear) and denominator (yield) of spin vector separately. 
                                 // Mean spin vector is numerator/denominator and is done in plotting script. Here, we must divide as the mean goes into integrand.
-				for (size_t mu = 0; mu<4; ++mu){
-				    if(dNdP_mother != 0){
-				        Sv_mother_lab[mu] = Sv_mother_lab[mu]/dNdP_mother;
+                                for (size_t mu = 0; mu<4; ++mu){
+                                    if(dNdP_mother != 0){
+                                        Sv_mother_lab[mu] = Sv_mother_lab[mu]/dNdP_mother;
 					Ss_mother_lab[mu] = Ss_mother_lab[mu]/dNdP_mother;
 				    }else{
 					Sv_mother_lab[mu] = 0.0;
@@ -407,12 +407,12 @@ void compute_polarization_feeddown(const std::vector<double>& pT_vec, const std:
                             }
                         }
                         
-                        primary.EdN_d3p_feeddown[i][j][k] = den_eq29;
+                        primary.EdN_d3p_feeddown[mother_id][i][j][k] = den_eq29;
                         for (int mu = 0; mu < 3; mu++) {
-                            primary.Pv_feeddown[i][j][k][mu] = num_eq29_vo[mu];
+                            primary.Pv_feeddown[mother_id][i][j][k][mu] = num_eq29_vo[mu];
                         }
                         for (int mu = 0; mu < 3; mu++) {
-                            primary.Ps_feeddown[i][j][k][mu] = num_eq29_sh[mu];
+                            primary.Ps_feeddown[mother_id][i][j][k][mu] = num_eq29_sh[mu];
                         }
                     }
                 }

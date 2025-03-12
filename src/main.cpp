@@ -56,10 +56,6 @@ int main(int argc, char** argv){
     }
     std::cout << "Data will be saved in the file: " << name_file_primary << std::endl;
    
-
-    std::vector<element> hypersup = {};
-    read_hypersurface(surface_file, hypersup);
-
     int size_pt = 31;
     int size_phi = 21;
     int size_y;
@@ -82,6 +78,9 @@ int main(int argc, char** argv){
     std::map<int, Particle> particles;
     //read_pdg_file("pdg-urqmd_v3.3+.dat", particles, size_pt, size_phi, size_y);
     read_pdg_file("./pdg_database/pdg-this_project.dat", particles, size_pt, size_phi, size_y);
+
+    std::vector<element> hypersup = {};
+    read_hypersurface(surface_file, hypersup);
     
     compute_primary(pT, phi, y_rap, particles, hypersup, exact, decay, 3122);
     
@@ -104,10 +103,16 @@ int main(int argc, char** argv){
                 for(int mu=0; mu<4; mu++)
                     fout << "   " << particles[3122].Ps_primary[i][j][k][mu];
                 if(decay){
+                    fout << " " << particles[3122].EdN_d3p_feeddown[3212][i][j][k];
                     for(int mu=0; mu<3; mu++)
-                        fout << "   " << particles[3122].Pv_feeddown[i][j][k][mu];
+                        fout << "   " << particles[3122].Pv_feeddown[3212][i][j][k][mu];
                     for(int mu=0; mu<3; mu++)
-                        fout << "   " << particles[3122].Ps_feeddown[i][j][k][mu];
+                        fout << "   " << particles[3122].Ps_feeddown[3212][i][j][k][mu];
+                    fout << " " << particles[3122].EdN_d3p_feeddown[3224][i][j][k];
+                    for(int mu=0; mu<3; mu++)
+                        fout << "   " << particles[3122].Pv_feeddown[3224][i][j][k][mu];
+                    for(int mu=0; mu<3; mu++)
+                        fout << "   " << particles[3122].Ps_feeddown[3224][i][j][k][mu];
                 }
                 fout << std::endl;
             }

@@ -22,17 +22,25 @@ void read_pdg_file(const std::string &filename, std::map<int, Particle> &particl
             int res_id;
             iss_decay >> res_id >> dc.num_daughters >> dc.branching_ratio;
 
-            for (int j = 0; j < dc.num_daughters; ++j) {
-                int daughter_id;
-                iss_decay >> daughter_id;
-                dc.daughters.push_back(daughter_id);
-            }
+            if (dc.num_daughters >= 2){
+              for (int j = 0; j < dc.num_daughters; ++j) {
+                  int daughter_id;
+                  iss_decay >> daughter_id;
+                  dc.daughters.push_back(daughter_id);
+              }
                 
-            p.decay_channels.push_back(dc);
+              p.decay_channels.push_back(dc);
                 
-            for (int j = dc.num_daughters; j < 5; ++j) {
-                int dummy;
-                iss_decay >> dummy;
+              for (int j = dc.num_daughters; j < 5; ++j) {
+                  int dummy;
+                  iss_decay >> dummy;
+              }
+
+              for (int daughter_pdg : dc.daughters) {
+                  if (particles.find(daughter_pdg) != particles.end()) {
+                      particles[daughter_pdg].allocate_feeddown(p.pdg_id);
+                  }
+              }
             }
         }
 

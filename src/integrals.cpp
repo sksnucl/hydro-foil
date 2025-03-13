@@ -329,7 +329,7 @@ void compute_polarization_feeddown(const std::vector<double>& pT_vec, const std:
                         // Integrate over solid angle = sin(th) dth dphi. Hence two loops
                         double num_eq29_vo[3] = {0., 0., 0.};
                         double num_eq29_sh[3] = {0., 0., 0.};
-                        double den_eq29;
+                        double den_eq29 = 1e-20;
                         #ifdef OPEN_MP
                         #pragma omp parallel for reduction(+:num_eq29_vo[:3], num_eq29_sh[:3], den_eq29) collapse(2)
                         #endif

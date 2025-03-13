@@ -396,8 +396,8 @@ void compute_polarization_feeddown(const std::vector<double>& pT_vec, const std:
                                     break;
                                     case 3224:
                                     for(int mu=0;mu<3;mu++){
-                                        num_eq29_vo[mu] += sin(thstar[ith])*(dNdP_mother/E_mother)*jac*0.4*(Sv_mother_RF[mu]-0.5*spv*pstar[mu])/(pstar_norm*pstar_norm);
-                                        num_eq29_sh[mu] += sin(thstar[ith])*(dNdP_mother/E_mother)*jac*0.4*(Ss_mother_RF[mu]-0.5*sps*pstar[mu])/(pstar_norm*pstar_norm);
+                                        num_eq29_vo[mu] += sin(thstar[ith])*(dNdP_mother/E_mother)*jac*0.4*(Sv_mother_RF[mu]-0.5*spv*pstar[mu]/(pstar_norm*pstar_norm));
+                                        num_eq29_sh[mu] += sin(thstar[ith])*(dNdP_mother/E_mother)*jac*0.4*(Ss_mother_RF[mu]-0.5*sps*pstar[mu]/(pstar_norm*pstar_norm));
                                     }
                                     break;
                                     default:

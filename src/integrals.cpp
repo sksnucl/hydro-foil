@@ -382,7 +382,7 @@ void compute_polarization_feeddown(const std::vector<double>& pT_vec, const std:
                                 Ss_mother_RF = RestFrameSpinVector(mother.mass, P_mother, S3_mother_lab);
                                 
                                 //solid angle integrand
-                                double jac = Jacobian(mother.mass, E_mother, P_mother, primary.mass, Estar, pstar);
+				double jac = Jacobian(mother.mass, p[0], p3, primary.mass, Estar, pstar);
                                 double spv = dotProduct(Sv_mother_RF,pstar);
                                 double sps = dotProduct(Ss_mother_RF,pstar);
 

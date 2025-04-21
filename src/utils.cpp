@@ -5,6 +5,7 @@
 #include <sstream>
 #include <string>
 #include <cassert>
+#include <cmath>
 #include "utils.h"
 
 int levi(int i, int j, int k, int l){
@@ -15,14 +16,13 @@ int levi(int i, int j, int k, int l){
 }
 
 int statistics(double spin) {
-    //returns 1 if Fermi, -1 if Bose statistics
-    const double dim_spin = 2 * spin + 1;
-    int dim_spin_int = static_cast<int>(dim_spin);
+    // returns 1 if Fermi, -1 if Bose, 0 if invalid
+    double twice_spin = 2.0 * spin;
+    double nearest = std::round(twice_spin);
+    if (std::abs(twice_spin - nearest) > 1e-6) return 0; // not valid spin
 
-    if (dim_spin != dim_spin_int) {
-        return 0;
-    }
-    return (dim_spin_int % 2 == 0) ? 1 : -1;
+    int n = static_cast<int>(nearest); // 2*spin as int
+    return (n % 2 == 1) ? 1 : -1; // odd → Fermion (1), even → Boson (-1)
 }
 
 //double dotProduct(const std::vector<double>& a, const std::vector<double>& b) {
